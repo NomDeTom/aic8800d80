@@ -24,6 +24,59 @@
 #include "aicwf_sdio.h"
 #else
 #include "aicwf_usb.h"
+
+#ifdef AICWF_USB_SUPPORT
+/*
+ * A command the firmware never answers marks the command manager crashed, and nothing clears that but
+ * loading the driver again: one late answer took the radio off the network until a person or a watchdog
+ * reloaded it. Instead, ask the USB core to reset the device (usb_queue_reset_device: the driver is
+ * unbound, the port reset, the driver bound again and the firmware loaded afresh), back in seconds.
+ * At most once a minute and three times in ten minutes: a chip that keeps failing is left crashed, for
+ * whatever watches the system to deal with.
+ *
+ * recover_on_timeout  1 (default): reset the device on a command timeout; 0: as before, stay crashed.
+ * fake_cmd_timeout    for testing: the next N commands count as timed out (writable at run time).
+ */
+static int recover_on_timeout = 1;
+module_param(recover_on_timeout, int, 0644);
+MODULE_PARM_DESC(recover_on_timeout, "Reset the USB device when the firmware stops answering a command (1, default) or stay crashed (0)");
+static int fake_cmd_timeout;
+module_param(fake_cmd_timeout, int, 0644);
+MODULE_PARM_DESC(fake_cmd_timeout, "Testing: count the next N commands as timed out");
+
+static unsigned long recover_at[3];   /* when the last three resets were asked for, in jiffies */
+
+static void aicwf_cmd_timeout_recover(struct rwnx_cmd_mgr *cmd_mgr)
+{
+    struct aic_usb_dev *usbdev = container_of(cmd_mgr, struct aic_usb_dev, cmd_mgr);
+    unsigned long now = jiffies;
+
+    if (!recover_on_timeout || !usbdev->intf)
+        return;
+    if (recover_at[0] && time_before(now, recover_at[0] + 60 * HZ)) {
+        printk(KERN_CRIT "aic8800: firmware not answering; a reset was asked for less than a minute ago\n");
+        return;
+    }
+    if (recover_at[2] && time_before(now, recover_at[2] + 600 * HZ)) {
+        printk(KERN_CRIT "aic8800: firmware not answering again: three resets in ten minutes, left crashed\n");
+        return;
+    }
+    recover_at[2] = recover_at[1];
+    recover_at[1] = recover_at[0];
+    recover_at[0] = now;
+    printk(KERN_CRIT "aic8800: firmware not answering: resetting the device to load it afresh\n");
+    usb_queue_reset_device(usbdev->intf);
+}
+
+static bool aicwf_fake_timeout(void)
+{
+    if (fake_cmd_timeout <= 0)
+        return false;
+    fake_cmd_timeout--;
+    printk(KERN_CRIT "aic8800: fake_cmd_timeout: this command counts as timed out\n");
+    return true;
+}
+#endif
 #endif
 /**
  *
@@ -257,7 +310,11 @@ static int cmd_mgr_queue(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
         }
         #else
         unsigned long tout = msecs_to_jiffies(RWNX_80211_CMD_TIMEOUT_MS/*AIDEN workaround* cmd_mgr->queue_sz*/);
-        if (!wait_for_completion_killable_timeout(&cmd->complete, tout)) {
+        if (
+        #ifdef AICWF_USB_SUPPORT
+            aicwf_fake_timeout() ||
+        #endif
+            !wait_for_completion_killable_timeout(&cmd->complete, tout)) {
             printk(KERN_CRIT"%s cmd timed-out cmd_mgr->queue_sz:%d\n", __func__,cmd_mgr->queue_sz);
         #ifdef AICWF_SDIO_SUPPORT
             ret = aicwf_sdio_writeb(sdiodev, SDIOWIFI_WAKEUP_REG, 2);
@@ -276,6 +333,9 @@ static int cmd_mgr_queue(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
             }
 			ret = -ETIMEDOUT;
             spin_unlock_bh(&cmd_mgr->lock);
+        #ifdef AICWF_USB_SUPPORT
+            aicwf_cmd_timeout_recover(cmd_mgr);
+        #endif
         }
 		else{
 			spin_lock_bh(&cmd_mgr->lock);
@@ -384,7 +444,11 @@ void cmd_mgr_task_process(struct work_struct *work)
             kfree(next->a2e_msg);
 
             tout = msecs_to_jiffies(RWNX_80211_CMD_TIMEOUT_MS * cmd_mgr->queue_sz);
-            if (!wait_for_completion_killable_timeout(&next->complete, tout)) {
+            if (
+            #ifdef AICWF_USB_SUPPORT
+                aicwf_fake_timeout() ||
+            #endif
+                !wait_for_completion_killable_timeout(&next->complete, tout)) {
                 printk(KERN_CRIT"%s cmd timed-out cmd_mgr->queue_sz:%d\n", __func__, cmd_mgr->queue_sz);
                 cmd_dump(next);
                 spin_lock_bh(&cmd_mgr->lock);
@@ -395,6 +459,9 @@ void cmd_mgr_task_process(struct work_struct *work)
                     cmd_complete(cmd_mgr, next);
                 }
                 spin_unlock_bh(&cmd_mgr->lock);
+            #ifdef AICWF_USB_SUPPORT
+                aicwf_cmd_timeout_recover(cmd_mgr);
+            #endif
             } else {
 				spin_lock_bh(&cmd_mgr->lock);
 				list_del(&next->list);

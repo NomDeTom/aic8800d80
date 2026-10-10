@@ -147,6 +147,7 @@ struct aic_usb_dev {
     struct rwnx_hw *rwnx_hw;
     struct aicwf_bus *bus_if;
     struct usb_device *udev;
+    struct usb_interface *intf;   /* for a reset when the firmware stops answering (rwnx_cmds.c) */
     struct device *dev;
     struct aicwf_rx_priv* rx_priv;
     enum aicwf_usb_state state;
