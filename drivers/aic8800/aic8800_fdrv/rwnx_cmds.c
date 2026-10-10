@@ -36,6 +36,10 @@
  *
  * recover_on_timeout  1 (default): reset the device on a command timeout; 0: as before, stay crashed.
  * fake_cmd_timeout    for testing: the next N commands count as timed out (writable at run time).
+ * recoveries          read-only: how many resets this driver has asked for since it was loaded.
+ * recovered_at        read-only: when the last was asked for, in seconds since boot (CLOCK_BOOTTIME, as
+ *                     /proc/uptime), 0 if none. Whatever watches the system can stand back while it works,
+ *                     without depending on a kernel log line that a busy log may already have overwritten.
  */
 static int recover_on_timeout = 1;
 module_param(recover_on_timeout, int, 0644);
@@ -43,6 +47,12 @@ MODULE_PARM_DESC(recover_on_timeout, "Reset the USB device when the firmware sto
 static int fake_cmd_timeout;
 module_param(fake_cmd_timeout, int, 0644);
 MODULE_PARM_DESC(fake_cmd_timeout, "Testing: count the next N commands as timed out");
+static unsigned int recoveries;
+module_param(recoveries, uint, 0444);
+MODULE_PARM_DESC(recoveries, "How many device resets have been asked for on a command timeout");
+static long recovered_at;
+module_param(recovered_at, long, 0444);
+MODULE_PARM_DESC(recovered_at, "When the last reset was asked for, in seconds since boot (0: none)");
 
 static unsigned long recover_at[3];   /* when the last three resets were asked for, in jiffies */
 
@@ -64,6 +74,8 @@ static void aicwf_cmd_timeout_recover(struct rwnx_cmd_mgr *cmd_mgr)
     recover_at[2] = recover_at[1];
     recover_at[1] = recover_at[0];
     recover_at[0] = now;
+    recoveries++;
+    recovered_at = (long)ktime_get_boottime_seconds();
     printk(KERN_CRIT "aic8800: firmware not answering: resetting the device to load it afresh\n");
     usb_queue_reset_device(usbdev->intf);
 }
